@@ -39,7 +39,13 @@ jobs:
           cp -a /tmp/yt-dlp-source/yt_dlp android-app/app/src/main/python/yt_dlp
           echo "Bundled yt-dlp: $(cat /tmp/yt-dlp-source/yt_dlp/version.py | head -5)"
       - name: Install compile SDK
-        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+        run: |
+          SDKMGR=$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -n 1)
+          if [ -n "$SDKMGR" ]; then
+            "$SDKMGR" 'platforms;android-35' 'build-tools;35.0.0'
+          else
+            echo 'No sdkmanager on PATH; Gradle will use preinstalled SDK packages'
+          fi
       - name: Build unsigned-by-release / debug-signed APK
         run: gradle -p android-app --no-daemon assembleDebug --stacktrace
       - name: Publish APK
