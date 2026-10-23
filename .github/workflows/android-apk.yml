@@ -5,6 +5,7 @@ on:
       - apk/flowsave
     paths:
       - 'android-app/**'
+      - 'tests/**'
       - '.github/workflows/android-apk.yml'
   workflow_dispatch:
 
@@ -37,20 +38,59 @@ jobs:
         run: |
           git clone --depth=1 --branch master https://github.com/Jvust2/yt-dlp.git /tmp/yt-dlp-source
           cp -a /tmp/yt-dlp-source/yt_dlp android-app/app/src/main/python/yt_dlp
-          echo "Bundled yt-dlp: $(cat /tmp/yt-dlp-source/yt_dlp/version.py | head -5)"
-      - name: Install compile SDK
+          echo "Bundled yt-dlp: $(head -5 /tmp/yt-dlp-source/yt_dlp/version.py)"
+      - name: Python bridge and extractor smoke tests (offline)
+        env:
+          PYTHONPATH: android-app/app/src/main/python
+        run: |
+          python -m pip install --quiet 'yt-dlp-ejs==0.8.0'
+          python -m unittest discover -s tests -v
+      - name: Install Android SDK and NDK
         run: |
           SDKMGR=$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -n 1)
-          if [ -n "$SDKMGR" ]; then
-            "$SDKMGR" 'platforms;android-35' 'build-tools;35.0.0'
-          else
-            echo 'No sdkmanager on PATH; Gradle will use preinstalled SDK packages'
+          if [ -z "$SDKMGR" ]; then echo 'sdkmanager unavailable' >&2; exit 1; fi
+          "$SDKMGR" 'platforms;android-35' 'build-tools;35.0.0'
+          if ! find "$ANDROID_HOME/ndk" -maxdepth 1 -type d -name '27.*' | grep -q .; then
+            "$SDKMGR" 'ndk;27.2.12479018'
           fi
-      - name: Build unsigned-by-release / debug-signed APK
+      - name: Compile Android QuickJS for YouTube EJS
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/bellard/quickjs.git /tmp/flowsave-quickjs
+          cd /tmp/flowsave-quickjs
+          make -j2 qjs
+          QJS_VERSION=$(cat VERSION)
+          NDK=$(find "$ANDROID_HOME/ndk" -mindepth 1 -maxdepth 1 -type d -name '27.*' | sort -V | tail -1)
+          if [ -z "$NDK" ]; then echo 'Android NDK 27 not found' >&2; exit 1; fi
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          for ABI in arm64-v8a x86_64; do
+            if [ "$ABI" = arm64-v8a ]; then TRIPLE=aarch64-linux-android; else TRIPLE=x86_64-linux-android; fi
+            CC="$TOOLCHAIN/${TRIPLE}24-clang"
+            OUTPUT="$GITHUB_WORKSPACE/android-app/app/src/main/jniLibs/$ABI/libqjs.so"
+            mkdir -p "$(dirname "$OUTPUT")"
+            "$CC" -O2 -fPIC -pie -D_GNU_SOURCE "-DCONFIG_VERSION=\"$QJS_VERSION\"" \
+              qjs.c repl.c quickjs.c dtoa.c libregexp.c libunicode.c cutils.c quickjs-libc.c \
+              -lm -ldl -pthread -o "$OUTPUT"
+            "$TOOLCHAIN/llvm-strip" "$OUTPUT"
+            file "$OUTPUT"
+            "$TOOLCHAIN/llvm-readelf" -h "$OUTPUT" | grep -E 'Type:|Machine:'
+          done
+          mkdir -p "$GITHUB_WORKSPACE/android-app/app/src/main/assets"
+          cp LICENSE "$GITHUB_WORKSPACE/android-app/app/src/main/assets/LICENSE-quickjs.txt"
+      - name: Build debug-signed APK
         run: gradle -p android-app --no-daemon assembleDebug --stacktrace
+      - name: APK package sanity check
+        run: |
+          APK=android-app/app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          unzip -l "$APK" | grep 'lib/arm64-v8a/libqjs.so'
+          unzip -l "$APK" | grep 'lib/x86_64/libqjs.so'
+          unzip -l "$APK" | grep 'classes.dex'
+          ls -lh "$APK"
       - name: Publish APK
         uses: actions/upload-artifact@v4
         with:
-          name: FlowSave-APK
+          name: FlowSave-v0.2-APK
           path: android-app/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
