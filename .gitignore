@@ -1,0 +1,6 @@
+.gradle/
+**/build/
+*.apk
+android-app/local.properties
+android-app/app/src/main/python/yt_dlp/
+.idea/
