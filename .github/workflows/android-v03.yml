@@ -1,0 +1,188 @@
+name: FlowSave 0.3 APK and device checks
+on:
+  push:
+    branches: [apk/flowsave-v03]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: flowsave-v03-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: apk/flowsave-v03
+      - name: Import reviewed 0.3 sources once
+        shell: bash
+        run: |
+          if [ -f .github/flowsave-v03-source-1.b64 ]; then
+            python - <<'PY'
+          import base64, hashlib, json, lzma, pathlib
+          raw=base64.b64decode(''.join(pathlib.Path(f'.github/flowsave-v03-source-{i}.b64').read_text().strip() for i in (1,2,3)), validate=False)
+          expected='45354a0367a41d93ca27544c996bf4b3ba1a78a7a00008255e4ce9f84a6ad2ef'
+          assert hashlib.sha256(raw).hexdigest()==expected, 'Source transport checksum mismatch'
+          files=json.loads(lzma.decompress(raw, memlimit=256*1024*1024))
+          assert len(files) == 19
+          for name, content in files.items():
+              path=pathlib.PurePosixPath(name)
+              assert not path.is_absolute() and '..' not in path.parts
+              assert path.parts[0] in ('android-app','server','tests','README.md','.gitignore','THIRD_PARTY_NOTICES.md','LICENSE-FLOWSAVE')
+              assert len(content.encode()) < 1000000
+              dest=pathlib.Path(name)
+              dest.parent.mkdir(parents=True,exist_ok=True)
+              dest.write_text(content)
+          PY
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add android-app server tests README.md .gitignore THIRD_PARTY_NOTICES.md LICENSE-FLOWSAVE
+            git rm .github/flowsave-v03-source-*.b64
+            git commit -m 'feat: materialize FlowSave 0.3 sources [skip ci]'
+            git push origin HEAD:apk/flowsave-v03
+          fi
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+      - name: Pin and bundle Python sources
+        run: |
+          set -e
+          mkdir -p vendor-source android-app/app/src/main/assets
+          git clone --depth=1 --branch master https://github.com/Jvust2/yt-dlp.git /tmp/flowsave-ytdlp
+          cp -a /tmp/flowsave-ytdlp/yt_dlp android-app/app/src/main/python/yt_dlp
+          cp /tmp/flowsave-ytdlp/LICENSE android-app/app/src/main/assets/LICENSE-yt-dlp.txt
+          git -C /tmp/flowsave-ytdlp archive --format=tar.gz HEAD > vendor-source/yt-dlp-source.tar.gz
+          python -m pip install 'gallery-dl==1.32.17' 'requests[socks]>=2.32.2,<3' 'yt-dlp-ejs==0.8.0'
+          python -m pip download --no-deps --no-binary=:all: -d vendor-source 'gallery-dl==1.32.17'
+          cp THIRD_PARTY_NOTICES.md android-app/app/src/main/assets/THIRD_PARTY_NOTICES.txt
+          echo "FlowSave source: $(git rev-parse HEAD)" > build-manifest.txt
+          echo "yt-dlp source: $(git -C /tmp/flowsave-ytdlp rev-parse HEAD)" >> build-manifest.txt
+          echo 'gallery-dl=1.32.17; yt-dlp-ejs=0.8.0; Chaquopy=17.1.0' >> build-manifest.txt
+      - name: Offline tests and synthetic media fixtures
+        env:
+          PYTHONPATH: android-app/app/src/main/python
+        run: |
+          if ! command -v ffmpeg; then sudo apt-get update -qq && sudo apt-get install -y ffmpeg; fi
+          set -o pipefail
+          python -m unittest discover -s tests -v 2>&1 | tee tests-result.txt
+          mkdir -p android-app/app/src/debug/assets/selftest
+          ffmpeg -v error -f lavfi -i color=c=blue:s=128x72:r=10 -t 0.5 -c:v libvpx-vp9 -an android-app/app/src/debug/assets/selftest/video.webm
+          ffmpeg -v error -f lavfi -i sine=frequency=440:sample_rate=48000 -t 0.5 -c:a libopus -vn android-app/app/src/debug/assets/selftest/audio.webm
+      - name: Install SDK and NDK
+        run: |
+          SDKMGR=$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -1)
+          "$SDKMGR" 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018'
+      - name: Build Android QuickJS
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/bellard/quickjs.git /tmp/flowsave-qjs
+          cd /tmp/flowsave-qjs
+          git archive --format=tar.gz HEAD > "$GITHUB_WORKSPACE/vendor-source/quickjs-source.tar.gz"
+          echo "QuickJS source: $(git rev-parse HEAD)" >> "$GITHUB_WORKSPACE/build-manifest.txt"
+          make -j2 qjs
+          VERSION=$(cat VERSION)
+          BIN="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          for ABI in arm64-v8a x86_64; do
+            if [ "$ABI" = arm64-v8a ]; then TRIPLE=aarch64-linux-android; else TRIPLE=x86_64-linux-android; fi
+            OUT="$GITHUB_WORKSPACE/android-app/app/src/main/jniLibs/$ABI/libqjs.so"
+            mkdir -p "$(dirname "$OUT")"
+            "$BIN/${TRIPLE}24-clang" -O2 -fPIC -pie -Wl,-z,max-page-size=16384 -D_GNU_SOURCE "-DCONFIG_VERSION=\"$VERSION\"" qjs.c repl.c quickjs.c dtoa.c libregexp.c libunicode.c cutils.c quickjs-libc.c -lm -ldl -pthread -o "$OUT"
+            "$BIN/llvm-strip" "$OUT"
+          done
+          cp LICENSE "$GITHUB_WORKSPACE/android-app/app/src/main/assets/LICENSE-quickjs.txt"
+      - name: Build minimal stream-copy FFmpeg for Android
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch n7.1.1 https://github.com/FFmpeg/FFmpeg.git /tmp/flowsave-ffmpeg
+          git -C /tmp/flowsave-ffmpeg archive --format=tar.gz HEAD > vendor-source/ffmpeg-7.1.1-source.tar.gz
+          echo "FFmpeg source: $(git -C /tmp/flowsave-ffmpeg rev-parse HEAD)" >> build-manifest.txt
+          cp /tmp/flowsave-ffmpeg/COPYING.LGPLv2.1 android-app/app/src/main/assets/LICENSE-ffmpeg.txt
+          BIN="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          for ABI in arm64-v8a x86_64; do
+            if [ "$ABI" = arm64-v8a ]; then TRIPLE=aarch64-linux-android; ARCH=aarch64; else TRIPLE=x86_64-linux-android; ARCH=x86_64; fi
+            mkdir -p "/tmp/ffbuild-$ABI"
+            cd "/tmp/ffbuild-$ABI"
+            /tmp/flowsave-ffmpeg/configure --target-os=android --arch="$ARCH" --enable-cross-compile \
+              --cc="$BIN/${TRIPLE}24-clang" --ar="$BIN/llvm-ar" --ranlib="$BIN/llvm-ranlib" --strip="$BIN/llvm-strip" \
+              --disable-autodetect --disable-everything --disable-network --disable-asm --disable-doc --disable-debug \
+              --enable-small --enable-ffmpeg --disable-ffplay --disable-ffprobe --enable-pic \
+              --enable-protocol=file,pipe --enable-demuxer=mov,matroska,mpegts,aac,mp3,ogg,flv \
+              --enable-muxer=mp4,matroska,webm,adts,mp3,ogg,ipod \
+              --enable-parser=aac,h264,hevc,vp9,av1,mpegaudio,opus \
+              --enable-bsf=aac_adtstoasc,extract_extradata,null,vp9_superframe,h264_mp4toannexb \
+              --extra-cflags='-fPIC' --extra-ldflags='-pie -Wl,-z,max-page-size=16384'
+            make -j2 ffmpeg
+            OUT="$GITHUB_WORKSPACE/android-app/app/src/main/jniLibs/$ABI/libffmpeg.so"
+            cp ffmpeg "$OUT"
+            "$BIN/llvm-strip" "$OUT"
+            cp ffbuild/config.mak "$GITHUB_WORKSPACE/vendor-source/ffmpeg-$ABI-config.mak"
+          done
+      - name: Build and inspect APK
+        run: |
+          set -o pipefail
+          gradle -p android-app --no-daemon assembleDebug --stacktrace 2>&1 | tee build-result.txt
+          mkdir -p deliverables
+          cp android-app/app/build/outputs/apk/debug/app-debug.apk deliverables/FlowSave-v0.3-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs deliverables/FlowSave-v0.3-debug.apk > deliverables/apk-signature.txt
+          unzip -l deliverables/FlowSave-v0.3-debug.apk | grep -E 'lib/(arm64-v8a|x86_64)/lib(ffmpeg|qjs).so'
+          cp build-manifest.txt tests-result.txt deliverables/
+          sha256sum deliverables/FlowSave-v0.3-debug.apk > deliverables/SHA256SUMS.txt
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Android emulator launch and native-engine tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 29
+          target: default
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot-save
+          script: |
+            adb install -r deliverables/FlowSave-v0.3-debug.apk
+            adb shell am start -n com.jvust.flowsave/.FlowActivity --ez selftest true
+            for i in $(seq 1 90); do adb shell run-as com.jvust.flowsave cat files/selftest.json > deliverables/device-selftest.json 2>/dev/null && break; sleep 2; done
+            cat deliverables/device-selftest.json
+            python -c 'import json; d=json.load(open("deliverables/device-selftest.json")); assert all(d.get(k) is True for k in ("ffmpeg","quickjs","vp9_opus_merge","gallery_extractors")),d'
+            adb shell am force-stop com.jvust.flowsave
+            adb shell am start -n com.jvust.flowsave/.FlowActivity
+            sleep 3
+            adb exec-out screencap -p > deliverables/interface.png
+            adb logcat -d -s AndroidRuntime:E > deliverables/android-errors.txt
+      - name: Package complete matching sources
+        if: always()
+        run: |
+          mkdir -p deliverables
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+          with zipfile.ZipFile('deliverables/FlowSave-v0.3-complete-source.zip','w',zipfile.ZIP_DEFLATED) as out:
+              for base in ('android-app','server','tests','.github','vendor-source'):
+                  for p in Path(base).rglob('*'):
+                      if not p.is_file() or any(part in ('build','.gradle','__pycache__','jniLibs') for part in p.parts): continue
+                      if p.name == 'local.properties': continue
+                      out.write(p, 'FlowSave/'+str(p))
+              for name in ('README.md','THIRD_PARTY_NOTICES.md','LICENSE-FLOWSAVE','build-manifest.txt','tests-result.txt'):
+                  p=Path(name)
+                  if p.exists():out.write(p,'FlowSave/'+name)
+          PY
+      - name: Publish APK, source and verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlowSave-v0.3-deliverables
+          path: deliverables/
+          if-no-files-found: error
