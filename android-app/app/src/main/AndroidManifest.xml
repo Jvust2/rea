@@ -8,9 +8,10 @@
         android:usesCleartextTraffic="false"
         android:extractNativeLibs="true"
         android:label="流影下载 FlowSave"
+        android:icon="@drawable/ic_flowsave"
         android:theme="@android:style/Theme.Material.NoActionBar">
         <activity
-            android:name=".MainActivity"
+            android:name=".FlowActivity"
             android:exported="true"
             android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>

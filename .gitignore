@@ -4,3 +4,10 @@
 android-app/local.properties
 android-app/app/src/main/python/yt_dlp/
 .idea/
+
+# Private server configuration
+server/.env
+*.keystore
+*.jks
+vendor-source/
+build-manifest.txt

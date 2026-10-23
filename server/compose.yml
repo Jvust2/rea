@@ -1,0 +1,37 @@
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    environment:
+      FLOWSAVE_TOKEN: ${FLOWSAVE_TOKEN:?Set a random token in .env}
+    volumes:
+      - jobs:/data
+    expose:
+      - '8080'
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 3g
+    cpus: 2
+    pids_limit: 128
+    restart: unless-stopped
+  https:
+    image: caddy:2
+    ports:
+      - '80:80'
+      - '443:443'
+    environment:
+      FLOWSAVE_DOMAIN: ${FLOWSAVE_DOMAIN:?Set your domain in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [app]
+    restart: unless-stopped
+volumes:
+  jobs:
+  caddy_data:
+  caddy_config:
